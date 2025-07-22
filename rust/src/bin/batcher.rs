@@ -26,16 +26,20 @@
 //!
 //! Once the batcher has downloaded (parts of) an index file, it will filter out URLs that are not in English or that did not return a 200 HTTP status code, batch them into groups whose size has a constant upper limit and push the messages containing these URls into a RabbitMQ queue.
 use clap::Parser;
+use pipeline::commoncrawl::{CdxEntry, ClusterIdxEntry};
+use pipeline::rabbitmq::{rabbitmq_connection_with_retry, retry_publish_batch};
 use lazy_static::lazy_static;
 use pipeline::{
     commoncrawl::{download_and_unzip, parse_cdx_line, parse_cluster_idx},
-    rabbitmq::{
-        publish_batch, rabbitmq_channel_with_queue, rabbitmq_connection, BATCH_SIZE, CC_QUEUE_NAME,
-    },
+    rabbitmq::{rabbitmq_channel_with_queue, BATCH_SIZE, CC_QUEUE_NAME},
     tracing_and_metrics::{run_metrics_server, setup_tracing},
 };
 use prometheus::{register_int_counter, IntCounter};
 use std::fs;
+use std::string::FromUtf8Error;
+
+const EXIT_CODE_SUCCESS: i32 = 0;
+const EXIT_CODE_FAILURE: i32 = 1;
 
 lazy_static! {
     static ref CLUSTER_IDX_EXCLUDED_ENTRIES_COUNTER: IntCounter = register_int_counter!(
@@ -76,7 +80,17 @@ async fn main() {
     setup_tracing();
     tokio::task::spawn(run_metrics_server(9000));
 
-    let rabbit_conn = rabbitmq_connection().await.unwrap();
+    let rabbit_conn = match rabbitmq_connection_with_retry(3).await {
+        Ok(conn) => {
+            tracing::info!("Connected to RabbitMQ");
+            conn
+        }
+        Err(e) => {
+            tracing::error!("{:?}", e);
+            std::process::exit(EXIT_CODE_FAILURE);
+        }
+    };
+
     let (channel, _queue) = rabbitmq_channel_with_queue(&rabbit_conn, CC_QUEUE_NAME)
         .await
         .unwrap();
@@ -90,45 +104,75 @@ async fn main() {
     let mut num_cdx_chunks_processed: usize = 0;
     for cdx_chunk in idx {
         print!(".");
-        let english_cdx_entries = String::from_utf8(
-            download_and_unzip(
-                &format!(
-                    "https://data.commoncrawl.org/cc-index/collections/CC-MAIN-2024-30/indexes/{}",
-                    cdx_chunk.cdx_filename
-                ),
-                cdx_chunk.cdx_offset,
-                cdx_chunk.cdx_length,
-            )
+        // First, download and decompress the data
+        let content = get_chunk_content(cdx_chunk, "CC-MAIN-2024-30")
             .await
-            .unwrap(),
-        )
-        .unwrap()
-        .lines()
-        .map(parse_cdx_line)
-        .filter(|e| {
-            if let Some(languages) = e.metadata.languages.as_ref() {
-                CLUSTER_IDX_MATCHING_ENTRIES_COUNTER.inc();
-                languages.contains("eng") && e.metadata.status == 200
-            } else {
-                CLUSTER_IDX_EXCLUDED_ENTRIES_COUNTER.inc();
-                false
-            }
-        })
-        .collect::<Vec<_>>();
+            .unwrap();
 
-        for batch in english_cdx_entries.as_slice().chunks(BATCH_SIZE) {
-            publish_batch(&channel, CC_QUEUE_NAME, batch).await;
+        // To avoid collecting to a potentially large vector, we can keep the iterator and make it
+        // a Peekable. This will allow us to evaluate if the next record is None.
+        let mut english_cdx_entries = select_english_entries(&*content).peekable();
+
+        // Which will loop and create batches, as long as there are more records to add to the
+        // current batch (until it reaches BATCH_SIZE).
+        while english_cdx_entries.peek().is_some() {
+            let batch = english_cdx_entries
+                .by_ref()
+                .take(BATCH_SIZE)
+                .collect::<Vec<_>>();
+
+            match retry_publish_batch(&channel, CC_QUEUE_NAME, &batch, 3).await {
+                Err(e) => {
+                    tracing::error!("Failed to publish batch: {:?}", e);
+                    std::process::exit(EXIT_CODE_FAILURE);
+                }
+                _ => {}
+            }
         }
-        num_cdx_chunks_processed += 1;
 
         CLUSTER_IDX_PROCESSED_CHUNKS.inc();
 
+        num_cdx_chunks_processed += 1;
         if let Some(to_process) = args.num_cdx_chunks_to_process {
             if to_process == num_cdx_chunks_processed {
                 break;
             }
         }
     }
+}
+
+async fn get_chunk_content(
+    chunk: ClusterIdxEntry,
+    collection: &str,
+) -> Result<String, FromUtf8Error> {
+    String::from_utf8(
+        download_and_unzip(
+            &format!(
+                "https://data.commoncrawl.org/cc-index/collections/{}/indexes/{}",
+                collection, chunk.cdx_filename
+            ),
+            chunk.cdx_offset,
+            chunk.cdx_length,
+        )
+        .await
+        .unwrap(),
+    )
+}
+
+// The returned iterator needs to share the same lifetime as the content, so to keep the borrower
+// happy, we make this explicit with &'a.
+fn select_english_entries<'a>(content: &'a str) -> impl Iterator<Item = CdxEntry> + 'a {
+    content.lines().map(parse_cdx_line).filter(|e| {
+        // Then, we iterate to filter entries by the "languages" metadata.
+        if let Some(languages) = e.metadata.languages.as_ref() {
+            if languages.contains("eng") && e.metadata.status == 200 {
+                CLUSTER_IDX_MATCHING_ENTRIES_COUNTER.inc();
+                return true
+            }
+        }
+        CLUSTER_IDX_EXCLUDED_ENTRIES_COUNTER.inc();
+        false
+    })
 }
 
 #[cfg(test)]
