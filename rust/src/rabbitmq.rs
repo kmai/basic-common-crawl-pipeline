@@ -136,7 +136,6 @@ pub async fn publish_batch(
     queue_name: &str,
     batch: &[CdxEntry],
 ) -> Result<PublisherConfirm, anyhow::Error> {
-    tracing::info!("Sending a batch of {} entries", batch.len());
     channel
         .basic_publish(
             "",
@@ -164,4 +163,27 @@ pub async fn retry_publish_batch(
         publish_batch(channel, queue_name, batch).await
     })
     .await
+}
+
+pub async fn get_channel_with_queue() -> Result<(Channel, Queue), anyhow::Error>{
+    let rabbit_conn = match rabbitmq_connection_with_retry(3).await {
+        Ok(conn) => {
+            tracing::debug!("Connected to RabbitMQ");
+            conn
+        },
+        Err(err) => return Err(err)
+    };
+
+    Ok(rabbitmq_channel_with_queue(&rabbit_conn, CC_QUEUE_NAME).await?)
+}
+
+pub async fn retry_get_channel_with_queue(retries: usize) -> Result<(Channel, Queue), anyhow::Error>{
+    let retry_strategy = ExponentialBackoff::from_millis(10)
+        // Jitter always looks nice as it helps having all clients reconnect at once
+        .map(jitter)
+        .take(retries);
+
+    Retry::spawn(retry_strategy, || async {
+        get_channel_with_queue().await
+    }).await
 }
