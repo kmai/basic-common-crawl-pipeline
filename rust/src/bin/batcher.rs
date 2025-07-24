@@ -27,16 +27,21 @@
 //! Once the batcher has downloaded (parts of) an index file, it will filter out URLs that are not in English or that did not return a 200 HTTP status code, batch them into groups whose size has a constant upper limit and push the messages containing these URls into a RabbitMQ queue.
 use clap::Parser;
 use pipeline::commoncrawl::{CdxEntry, ClusterIdxEntry};
-use pipeline::rabbitmq::{rabbitmq_connection_with_retry, retry_publish_batch};
+use pipeline::rabbitmq::{retry_publish_batch, retry_get_channel_with_queue};
 use lazy_static::lazy_static;
 use pipeline::{
     commoncrawl::{download_and_unzip, parse_cdx_line, parse_cluster_idx},
-    rabbitmq::{rabbitmq_channel_with_queue, BATCH_SIZE, CC_QUEUE_NAME},
+    rabbitmq::{BATCH_SIZE, CC_QUEUE_NAME},
     tracing_and_metrics::{run_metrics_server, setup_tracing},
 };
 use prometheus::{register_int_counter, IntCounter};
 use std::fs;
 use std::string::FromUtf8Error;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use lapin::Channel;
+use futures::future::join_all;
+use tokio::sync::Semaphore;
 
 const EXIT_CODE_SUCCESS: i32 = 0;
 const EXIT_CODE_FAILURE: i32 = 1;
@@ -64,14 +69,25 @@ lazy_static! {
 struct Args {
     /// For an explanation for why this file needs to be provided, please
     /// see Readme.md, section "Why do we download the cluster.idx file up front?".
-    #[arg(short, long, default_value = "cluster.idx")]
+    #[arg(short='f', long, default_value = "cluster.idx")]
     cluster_idx_filename: String,
 
     /// This command line argument can be used to limit the number of chunks that should be processed.
     /// If set, the batcher only processes so many lines from the provided cluster.idx file.
     /// Otherwise, it processes all entries in the file.
-    #[arg(short, long)]
+    #[arg(short='c', long)]
     num_cdx_chunks_to_process: Option<usize>,
+
+    /// This command line argument can be used to specify the crawl version to use.
+    /// If set, the batcher will attempt to download the chunks from the specified collection.
+    /// Even though it might be outdated, it defaults to CC-MAIN-2024-30.
+    #[arg(short='v', long, default_value = "CC-MAIN-2024-30")]
+    crawl_version: String,
+
+    /// This command line argument can be used to specify the number of simultaneous chunks to be
+    /// processed. It controls the number of Semaphore permits instantiated.
+    #[arg(short='p', long)]
+    parallelism: Option<usize>,
 }
 
 #[tokio::main]
@@ -80,63 +96,102 @@ async fn main() {
     setup_tracing();
     tokio::task::spawn(run_metrics_server(9000));
 
-    let rabbit_conn = match rabbitmq_connection_with_retry(3).await {
-        Ok(conn) => {
-            tracing::info!("Connected to RabbitMQ");
-            conn
-        }
+    let filename = args.cluster_idx_filename.clone();
+    let crawl_version = args.crawl_version.clone();
+    let parallelism = args.parallelism.unwrap_or(4);
+
+    tracing::info!(
+        "Starting batcher. Cluster Index filename: {} - Max chunks: {:?} - Crawl Version: {} - Parallelism: {} ",
+        filename, args.num_cdx_chunks_to_process, crawl_version, parallelism
+    );
+
+    let (channel, _queue) = match retry_get_channel_with_queue(3).await {
+        Ok(channel_and_queue) => channel_and_queue,
         Err(e) => {
             tracing::error!("{:?}", e);
             std::process::exit(EXIT_CODE_FAILURE);
         }
     };
 
-    let (channel, _queue) = rabbitmq_channel_with_queue(&rabbit_conn, CC_QUEUE_NAME)
+    // Since we want to do parallel processing, it'd be wise to use atomic reference count
+    // to share ownership of the channel.
+    let channel = Arc::new(channel);
+
+    let collection = match fs::read_to_string(&filename){
+        Ok(content) => {
+            if let Some(count) = args.num_cdx_chunks_to_process {
+                content.lines().filter_map(parse_cluster_idx).take(count).collect::<Vec<_>>()
+            } else {
+                content.lines().filter_map(parse_cluster_idx).collect::<Vec<_>>()
+            }
+        },
+        Err(e) => {
+            tracing::error!("{:?}", e);
+            std::process::exit(EXIT_CODE_FAILURE);
+        }
+    };
+
+    let number_of_chunks = collection.len();
+
+    // We instantiate a semaphore to max out the number of parallel tasks
+    let semaphore = Arc::new(Semaphore::new(parallelism));
+
+    // We need an AtomicUsize to avoid race conditions or ownership problems with the borrower.
+    let processed = Arc::new(AtomicUsize::new(0));
+    let mut tasks = Vec::new();
+
+    for cdx_chunk in collection {
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let channel = Arc::clone(&channel);
+        let crawl_version = crawl_version.clone();
+        let processed = Arc::clone(&processed);
+
+        let task = tokio::spawn(async move {
+            print!(".");
+            process_chunk(cdx_chunk, &channel, &crawl_version).await;
+            CLUSTER_IDX_PROCESSED_CHUNKS.inc();
+            // AtomicUsize.fetch_add(val, Ordering) adds 'val' atomically and returns the previous
+            // value, to which we add 1 to get the current one.
+            // As we're calculating a percentage, order isn't important (hence Ordering::Relaxed).
+            let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!("Processed {:.2}% chunks", current as f32 / number_of_chunks as f32 * 100.0);
+            drop(permit);
+        });
+
+        tasks.push(task);
+    }
+
+    join_all(tasks).await;
+
+    tracing::info!("Finished processing {number_of_chunks} chunks from {filename} file.");
+    std::process::exit(EXIT_CODE_SUCCESS);
+}
+
+async fn process_chunk(chunk: ClusterIdxEntry, channel: &Arc<Channel>, crawl_version: &str) {
+    // First, download and decompress the data
+    let chunk_content = get_chunk_content(chunk, crawl_version)
         .await
         .unwrap();
 
-    let idx = fs::read_to_string(args.cluster_idx_filename)
-        .expect("Should have been able to read the file")
-        .lines()
-        .filter_map(parse_cluster_idx)
-        .collect::<Vec<_>>();
+    // To avoid collecting to a potentially large vector, we can keep the iterator and make it
+    // a Peekable. This will allow us to evaluate if the next record is None.
+    let mut english_cdx_entries = select_english_entries(&*chunk_content).peekable();
 
-    let mut num_cdx_chunks_processed: usize = 0;
-    for cdx_chunk in idx {
-        print!(".");
-        // First, download and decompress the data
-        let content = get_chunk_content(cdx_chunk, "CC-MAIN-2024-30")
-            .await
-            .unwrap();
+    // Which will loop and create batches, as long as there are more records to add to the
+    // current batch (until it reaches BATCH_SIZE).
+    while english_cdx_entries.peek().is_some() {
+        // We collect only what fills a batch
+        let batch = english_cdx_entries
+            .by_ref()
+            .take(BATCH_SIZE)
+            .collect::<Vec<_>>();
 
-        // To avoid collecting to a potentially large vector, we can keep the iterator and make it
-        // a Peekable. This will allow us to evaluate if the next record is None.
-        let mut english_cdx_entries = select_english_entries(&*content).peekable();
-
-        // Which will loop and create batches, as long as there are more records to add to the
-        // current batch (until it reaches BATCH_SIZE).
-        while english_cdx_entries.peek().is_some() {
-            let batch = english_cdx_entries
-                .by_ref()
-                .take(BATCH_SIZE)
-                .collect::<Vec<_>>();
-
-            match retry_publish_batch(&channel, CC_QUEUE_NAME, &batch, 3).await {
-                Err(e) => {
-                    tracing::error!("Failed to publish batch: {:?}", e);
-                    std::process::exit(EXIT_CODE_FAILURE);
-                }
-                _ => {}
+        match retry_publish_batch(&channel, CC_QUEUE_NAME, &batch, 3).await {
+            Err(e) => {
+                tracing::error!("Failed to publish batch: {:?}", e);
+                std::process::exit(EXIT_CODE_FAILURE);
             }
-        }
-
-        CLUSTER_IDX_PROCESSED_CHUNKS.inc();
-
-        num_cdx_chunks_processed += 1;
-        if let Some(to_process) = args.num_cdx_chunks_to_process {
-            if to_process == num_cdx_chunks_processed {
-                break;
-            }
+            _ => {}
         }
     }
 }
