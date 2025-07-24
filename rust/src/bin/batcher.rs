@@ -117,7 +117,7 @@ async fn main() {
     // to share ownership of the channel.
     let channel = Arc::new(channel);
 
-    let collection = match fs::read_to_string(filename){
+    let collection = match fs::read_to_string(&filename){
         Ok(content) => {
             if let Some(count) = args.num_cdx_chunks_to_process {
                 content.lines().filter_map(parse_cluster_idx).take(count).collect::<Vec<_>>()
@@ -150,6 +150,9 @@ async fn main() {
             print!(".");
             process_chunk(cdx_chunk, &channel, &crawl_version).await;
             CLUSTER_IDX_PROCESSED_CHUNKS.inc();
+            // AtomicUsize.fetch_add(val, Ordering) adds 'val' atomically and returns the previous
+            // value, to which we add 1 to get the current one.
+            // As we're calculating a percentage, order isn't important (hence Ordering::Relaxed).
             let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
             tracing::info!("Processed {:.2}% chunks", current as f32 / number_of_chunks as f32 * 100.0);
             drop(permit);
@@ -160,7 +163,7 @@ async fn main() {
 
     join_all(tasks).await;
 
-    tracing::info!("Finished processing {number_of_chunks} chunks from cluster.idx file.");
+    tracing::info!("Finished processing {number_of_chunks} chunks from {filename} file.");
     std::process::exit(EXIT_CODE_SUCCESS);
 }
 
